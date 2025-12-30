@@ -1,0 +1,43 @@
+# --- GENERAL ---
+.DS_Store
+*.log
+.vscode/
+.idea/
+
+# --- FRONTEND (Next.js) ---
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+frontend/.env.development.local
+frontend/.env.test.local
+frontend/.env.production.local
+frontend/npm-debug.log*
+frontend/yarn-debug.log*
+frontend/yarn-error.log*
+
+# --- BACKEND (Python) ---
+backend/__pycache__/
+backend/*.py[cod]
+backend/*$py.class
+backend/venv/
+backend/.venv/
+backend/env/
+backend/.env
+
+# --- DATABASES (Crucial to ignore) ---
+*.db
+*.sqlite3
+
+# --- USER CONTENT (Don't commit generated images/videos) ---
+backend/uploads/
+backend/generated/
+
+# --- PYTHON PACKAGES ---
+*.egg
+*.egg-info/
+dist/
+build/
