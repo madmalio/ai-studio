@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
-import { toast } from "sonner"; // <--- NEW IMPORT
+import { toast } from "sonner";
 
 import { CAMERAS, LENSES, FOCAL_LENGTHS, MOVEMENTS } from "@/lib/constants";
 import { GearModal } from "@/components/GearModal";
@@ -24,6 +24,8 @@ import { SourceModal } from "@/components/SourceModal";
 import { ResultSidebar } from "@/components/ResultSidebar";
 import { GalleryGrid } from "@/components/GalleryGrid";
 import { DeleteModal } from "@/components/DeleteModal";
+// IMPORT NEW MODAL
+import { MultishotModal } from "@/components/MultishotModal";
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
@@ -53,6 +55,12 @@ export default function CinemaStudioPage() {
 
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [itemToDelete, setItemToDelete] = useState<any>(null);
+
+  // NEW MULTISHOT STATE
+  const [isMultishotModalOpen, setIsMultishotModalOpen] = useState(false);
+  const [multishotSourceId, setMultishotSourceId] = useState<number | null>(
+    null
+  );
 
   const [selectedGear, setSelectedGear] = useState({
     camera: CAMERAS[0],
@@ -97,7 +105,6 @@ export default function CinemaStudioPage() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // Toast for upload start
     const toastId = toast.loading("Uploading reference image...");
 
     const reader = new FileReader();
@@ -111,7 +118,7 @@ export default function CinemaStudioPage() {
           body: JSON.stringify({ base64_data: base64data }),
         });
         fetchData();
-        toast.success("Upload complete", { id: toastId }); // Update toast
+        toast.success("Upload complete", { id: toastId });
       } catch (e) {
         console.error("Upload save failed", e);
         toast.error("Upload failed", { id: toastId });
@@ -123,9 +130,13 @@ export default function CinemaStudioPage() {
 
   const removeReferenceImage = (index: number) =>
     setReferenceImages((prev) => prev.filter((_, i) => i !== index));
+
   const handleSelectReference = (urlData: string) => {
-    if (!referenceImages.includes(urlData))
+    if (!referenceImages.includes(urlData)) {
       setReferenceImages((prev) => [...prev, urlData]);
+      toast.success("Added to reference images");
+      setIsSourceModalOpen(false);
+    }
   };
 
   // --- VIEW LOGIC ---
@@ -193,7 +204,6 @@ export default function CinemaStudioPage() {
     setResultUrl(null);
     setIsSidebarOpen(false);
 
-    // Toast Logic
     const toastId = toast.loading("Developing your shot...", {
       description: `Using ${selectedGear.camera.name}`,
     });
@@ -254,6 +264,39 @@ export default function CinemaStudioPage() {
     e.stopPropagation();
 
     switch (action) {
+      // NEW MULTISHOT LOGIC
+      case "multishot":
+        if (item.type !== "image") {
+          toast.error("Multishot is only for images.");
+          return;
+        }
+
+        const msToastId = toast.loading("Generating 9 alternative angles...", {
+          description: "This takes about 15-20 seconds.",
+        });
+        try {
+          // 1. Trigger backend generation of low-res proxies
+          const res = await fetch("http://127.0.0.1:8000/generate-multishot", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ source_image_id: item.id }),
+          });
+          const data = await res.json();
+
+          if (data.status === "success" && data.proxy_ids.length > 0) {
+            toast.success("Angles generated!", { id: msToastId });
+            // 2. Open the selection modal
+            setMultishotSourceId(item.id);
+            setIsMultishotModalOpen(true);
+          } else {
+            throw new Error("Failed to generate proxies");
+          }
+        } catch (e) {
+          toast.error("Multishot generation failed.", { id: msToastId });
+          console.error(e);
+        }
+        break;
+
       case "delete":
         setItemToDelete(item);
         setIsDeleteModalOpen(true);
@@ -272,9 +315,6 @@ export default function CinemaStudioPage() {
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ is_favorite: newVal }),
           });
-          toast.success(
-            newVal ? "Added to favorites" : "Removed from favorites"
-          );
         } catch (e) {
           toast.error("Failed to update favorite");
         }
@@ -663,11 +703,19 @@ export default function CinemaStudioPage() {
         onSelectMovement={setSelectedMovement}
       />
 
-      {/* --- CONFIRMATION MODAL --- */}
+      {/* --- MODALS --- */}
       <DeleteModal
         isOpen={isDeleteModalOpen}
         onClose={() => setIsDeleteModalOpen(false)}
         onConfirm={confirmDelete}
+      />
+
+      {/* NEW MULTISHOT MODAL */}
+      <MultishotModal
+        isOpen={isMultishotModalOpen}
+        onClose={() => setIsMultishotModalOpen(false)}
+        sourceItemId={multishotSourceId}
+        onUpscaleComplete={fetchData} // Reload gallery after upscaling
       />
     </main>
   );
