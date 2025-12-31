@@ -1,6 +1,7 @@
 import {
   Film,
   Layers,
+  LayoutTemplate,
   ArrowRightCircle,
   ArrowLeftCircle,
   Heart,
@@ -52,13 +53,24 @@ export function GalleryGrid({ items, onSelect, onAction }: GalleryGridProps) {
 
           <div className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity duration-200 flex flex-col justify-between p-3">
             <div className="flex items-start justify-end content-start gap-1 flex-wrap w-full">
-              {/* ... Top Buttons (Same as before) ... */}
+              {/* BUTTON 1: View Storyboard */}
+              <button
+                onClick={(e) => onAction(e, "view_proxies", item)}
+                className="flex items-center gap-1.5 text-[10px] font-bold text-white/70 hover:text-white hover:bg-white/10 px-2 py-1 rounded-md transition-all"
+              >
+                <LayoutTemplate size={13} /> View
+              </button>
+
+              {/* BUTTON 2: Generate Multishot (Renamed back to Multishot) */}
               <button
                 onClick={(e) => onAction(e, "multishot", item)}
                 className="flex items-center gap-1.5 text-[10px] font-bold text-white/70 hover:text-white hover:bg-white/10 px-2 py-1 rounded-md transition-all"
               >
                 <Layers size={13} /> Multishot
               </button>
+
+              {/* --------------------------- */}
+
               <button
                 onClick={(e) => onAction(e, "ref", item)}
                 className="flex items-center gap-1.5 text-[10px] font-bold text-white/70 hover:text-white hover:bg-white/10 px-2 py-1 rounded-md transition-all"
@@ -90,7 +102,6 @@ export function GalleryGrid({ items, onSelect, onAction }: GalleryGridProps) {
               </div>
 
               <div className="flex items-center gap-0 shrink-0">
-                {/* FAVORITE BUTTON: Checks is_favorite state */}
                 <button
                   onClick={(e) => onAction(e, "like", item)}
                   className={cn(

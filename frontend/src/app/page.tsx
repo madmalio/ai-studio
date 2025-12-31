@@ -12,11 +12,11 @@ import {
   Clock,
   ChevronLeft,
   LayoutTemplate,
+  Ratio,
 } from "lucide-react";
 import { clsx, type ClassValue } from "clsx";
 import { twMerge } from "tailwind-merge";
 import { toast } from "sonner";
-
 import { CAMERAS, LENSES, FOCAL_LENGTHS, MOVEMENTS } from "@/lib/constants";
 import { GearModal } from "@/components/GearModal";
 import { MovementsModal } from "@/components/MovementsModal";
@@ -24,12 +24,14 @@ import { SourceModal } from "@/components/SourceModal";
 import { ResultSidebar } from "@/components/ResultSidebar";
 import { GalleryGrid } from "@/components/GalleryGrid";
 import { DeleteModal } from "@/components/DeleteModal";
-// IMPORT NEW MODAL
 import { MultishotModal } from "@/components/MultishotModal";
+import { MultishotConfirmModal } from "@/components/MultishotConfirmModal"; // <--- NEW IMPORT
 
 function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
+
+const ASPECT_RATIOS = ["21:9", "16:9", "4:3", "1:1", "9:16"];
 
 export default function CinemaStudioPage() {
   // --- STATE ---
@@ -42,22 +44,23 @@ export default function CinemaStudioPage() {
   const [galleryFilter, setGalleryFilter] = useState<"image" | "video">(
     "image"
   );
-
   const [history, setHistory] = useState<any[]>([]);
   const [uploads, setUploads] = useState<any[]>([]);
   const [referenceImages, setReferenceImages] = useState<string[]>([]);
   const [imageStrength, setImageStrength] = useState(0.75);
+  const [aspectRatio, setAspectRatio] = useState("21:9"); // <--- NEW STATE
 
   const [isGearModalOpen, setIsGearModalOpen] = useState(false);
   const [isSourceModalOpen, setIsSourceModalOpen] = useState(false);
   const [isMovementsModalOpen, setIsMovementsModalOpen] = useState(false);
   const [isSidebarOpen, setIsSidebarOpen] = useState(false);
-
   const [isDeleteModalOpen, setIsDeleteModalOpen] = useState(false);
   const [itemToDelete, setItemToDelete] = useState<any>(null);
 
-  // NEW MULTISHOT STATE
+  // MULTISHOT STATE
   const [isMultishotModalOpen, setIsMultishotModalOpen] = useState(false);
+  const [isMultishotConfirmOpen, setIsMultishotConfirmOpen] = useState(false); // <--- NEW STATE
+  const [itemForMultishot, setItemForMultishot] = useState<any>(null); // <--- NEW STATE
   const [multishotSourceId, setMultishotSourceId] = useState<number | null>(
     null
   );
@@ -71,7 +74,6 @@ export default function CinemaStudioPage() {
 
   const promptRefWithImages = useRef<HTMLTextAreaElement>(null);
   const promptRefNoImages = useRef<HTMLTextAreaElement>(null);
-
   const autosizePrompt = (el: HTMLTextAreaElement | null) => {
     if (!el) return;
     el.style.height = "0px";
@@ -104,7 +106,6 @@ export default function CinemaStudioPage() {
   const handleNewUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
-
     const toastId = toast.loading("Uploading reference image...");
 
     const reader = new FileReader();
@@ -127,7 +128,6 @@ export default function CinemaStudioPage() {
     reader.readAsDataURL(file);
     setIsSourceModalOpen(false);
   };
-
   const removeReferenceImage = (index: number) =>
     setReferenceImages((prev) => prev.filter((_, i) => i !== index));
 
@@ -151,18 +151,15 @@ export default function CinemaStudioPage() {
     setViewMode("empty");
     clearDock();
   };
-
   const openGallery = (type: "image" | "video") => {
     setResultUrl(null);
     setViewMode("gallery");
     setGalleryFilter(type);
     clearDock();
   };
-
   const selectFromGallery = (item: any) => {
     setResultUrl(item.url);
     if (item.prompt) setPrompt(item.prompt);
-
     const cameraObj = CAMERAS.find((c) => c.name === item.camera) || CAMERAS[0];
     const lensObj = LENSES.find((l) => l.name === item.lens) || LENSES[0];
     const focalLengthVal = item.focal_length || FOCAL_LENGTHS[0];
@@ -172,7 +169,6 @@ export default function CinemaStudioPage() {
       lens: lensObj,
       focalLength: focalLengthVal,
     });
-
     setIsSidebarOpen(true);
     setActiveTab(item.type);
   };
@@ -207,7 +203,6 @@ export default function CinemaStudioPage() {
     const toastId = toast.loading("Developing your shot...", {
       description: `Using ${selectedGear.camera.name}`,
     });
-
     try {
       const endpoint =
         activeTab === "image" ? "/generate-image" : "/generate-video";
@@ -216,9 +211,8 @@ export default function CinemaStudioPage() {
         camera: selectedGear.camera.name,
         lens: selectedGear.lens.name,
         focal_length: selectedGear.focalLength,
-        aspect_ratio: "21:9",
+        aspect_ratio: aspectRatio, // <--- USE SELECTED RATIO
       };
-
       if (activeTab === "image") {
         payload.reference_images = referenceImages;
         payload.image_strength = imageStrength;
@@ -262,39 +256,46 @@ export default function CinemaStudioPage() {
     item: any
   ) => {
     e.stopPropagation();
-
     switch (action) {
-      // NEW MULTISHOT LOGIC
+      // VIEW PROXIES
+      case "view_proxies":
+        if (item.type !== "image") {
+          toast.error("Storyboards are only for images.");
+          return;
+        }
+
+        try {
+          const res = await fetch(`http://127.0.0.1:8000/proxies/${item.id}`);
+          const data = await res.json();
+
+          if (data && data.length > 0) {
+            setMultishotSourceId(item.id);
+            setIsMultishotModalOpen(true);
+            toast.success("Opening storyboard...");
+          } else {
+            toast("No storyboard found.", {
+              description: "Click 'Multishot' to create one.",
+              action: {
+                label: "Generate",
+                onClick: () => handleAction(e, "multishot", item),
+              },
+            });
+          }
+        } catch (err) {
+          console.error(err);
+          toast.error("Failed to load storyboard.");
+        }
+        break;
+
+      // MULTISHOT (TRIGGER CONFIRMATION)
       case "multishot":
         if (item.type !== "image") {
           toast.error("Multishot is only for images.");
           return;
         }
-
-        const msToastId = toast.loading("Generating 9 alternative angles...", {
-          description: "This takes about 15-20 seconds.",
-        });
-        try {
-          // 1. Trigger backend generation of low-res proxies
-          const res = await fetch("http://127.0.0.1:8000/generate-multishot", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ source_image_id: item.id }),
-          });
-          const data = await res.json();
-
-          if (data.status === "success" && data.proxy_ids.length > 0) {
-            toast.success("Angles generated!", { id: msToastId });
-            // 2. Open the selection modal
-            setMultishotSourceId(item.id);
-            setIsMultishotModalOpen(true);
-          } else {
-            throw new Error("Failed to generate proxies");
-          }
-        } catch (e) {
-          toast.error("Multishot generation failed.", { id: msToastId });
-          console.error(e);
-        }
+        // OPEN CONFIRMATION MODAL INSTEAD OF GENERATING IMMEDIATELY
+        setItemForMultishot(item);
+        setIsMultishotConfirmOpen(true);
         break;
 
       case "delete":
@@ -366,6 +367,36 @@ export default function CinemaStudioPage() {
 
       default:
         toast("Feature coming soon!");
+    }
+  };
+
+  // ACTUAL MULTISHOT GENERATION (Called after confirmation)
+  const executeMultishotGeneration = async () => {
+    if (!itemForMultishot) return;
+    setIsMultishotConfirmOpen(false);
+
+    const msToastId = toast.loading("Generating 9 alternative angles...", {
+      description: "This takes about 15-20 seconds.",
+    });
+
+    try {
+      const res = await fetch("http://127.0.0.1:8000/generate-multishot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ source_image_id: itemForMultishot.id }),
+      });
+      const data = await res.json();
+
+      if (data.status === "success" && data.proxy_ids.length > 0) {
+        toast.success("Angles generated!", { id: msToastId });
+        setMultishotSourceId(itemForMultishot.id);
+        setIsMultishotModalOpen(true);
+      } else {
+        throw new Error("Failed to generate proxies");
+      }
+    } catch (e) {
+      toast.error("Multishot generation failed.", { id: msToastId });
+      console.error(e);
     }
   };
 
@@ -473,7 +504,17 @@ export default function CinemaStudioPage() {
             isSidebarOpen ? "pr-[420px]" : ""
           )}
         >
-          <div className="relative w-full max-w-[90%] aspect-[21/9] bg-black overflow-hidden shadow-[0_0_150px_rgba(0,0,0,0.5)] animate-in zoom-in-95 duration-300">
+          <div
+            className={cn(
+              "relative w-full max-w-[90%] bg-black overflow-hidden shadow-[0_0_150px_rgba(0,0,0,0.5)] animate-in zoom-in-95 duration-300",
+              // DYNAMIC ASPECT RATIO FOR VIEWER
+              aspectRatio === "9:16"
+                ? "aspect-[9/16] h-[90vh]"
+                : aspectRatio === "1:1"
+                ? "aspect-square h-[90vh]"
+                : "aspect-[21/9]"
+            )}
+          >
             {resultUrl.endsWith(".mp4") ? (
               <video
                 src={resultUrl}
@@ -555,7 +596,7 @@ export default function CinemaStudioPage() {
                       <img src={img} className="w-full h-full object-cover" />
                       <button
                         onClick={() => removeReferenceImage(index)}
-                        className="absolute inset-0 bg-black/60 opacity-0 group-hover/thumb:opacity-100 transition-opacity flex items-center justify-center text-white"
+                        className="absolute inset-0 bg-black/60 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white"
                       >
                         <X size={12} />
                       </button>
@@ -619,7 +660,7 @@ export default function CinemaStudioPage() {
             )}
 
             <div className="flex items-center gap-2">
-              {activeTab === "video" && (
+              {activeTab === "video" ? (
                 <>
                   <button
                     onClick={() => setIsMovementsModalOpen(true)}
@@ -632,6 +673,27 @@ export default function CinemaStudioPage() {
                     <Clock size={12} /> 5s
                   </button>
                 </>
+              ) : (
+                // --- ASPECT RATIO SELECTOR (IMAGE MODE) ---
+                <div className="flex items-center gap-1">
+                  <span className="text-zinc-600 mr-1">
+                    <Ratio size={12} />
+                  </span>
+                  {ASPECT_RATIOS.map((ratio) => (
+                    <button
+                      key={ratio}
+                      onClick={() => setAspectRatio(ratio)}
+                      className={cn(
+                        "px-2 py-1 rounded-md text-[10px] font-bold border transition-all",
+                        aspectRatio === ratio
+                          ? "bg-zinc-800 text-white border-zinc-600"
+                          : "text-zinc-500 border-transparent hover:text-zinc-300 hover:bg-zinc-800/50"
+                      )}
+                    >
+                      {ratio}
+                    </button>
+                  ))}
+                </div>
               )}
             </div>
           </div>
@@ -710,12 +772,17 @@ export default function CinemaStudioPage() {
         onConfirm={confirmDelete}
       />
 
-      {/* NEW MULTISHOT MODAL */}
       <MultishotModal
         isOpen={isMultishotModalOpen}
         onClose={() => setIsMultishotModalOpen(false)}
         sourceItemId={multishotSourceId}
-        onUpscaleComplete={fetchData} // Reload gallery after upscaling
+        onUpscaleComplete={fetchData}
+      />
+
+      <MultishotConfirmModal
+        isOpen={isMultishotConfirmOpen}
+        onClose={() => setIsMultishotConfirmOpen(false)}
+        onConfirm={executeMultishotGeneration}
       />
     </main>
   );

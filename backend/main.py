@@ -1,22 +1,26 @@
-import base64
 import os
-import sqlite3
+import json
+import random
 import time
-import shutil
+import sqlite3
 import asyncio
-from typing import Optional, List, Union
-
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+import shutil
+import urllib.request
+import urllib.parse
+from typing import List, Optional
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import uvicorn
-import fal_client
 from dotenv import load_dotenv
+import websocket # pip install websocket-client
+import requests # pip install requests
 
 # --- CONFIGURATION ---
 load_dotenv()
 
+# DIRECTORIES
 UPLOAD_DIR = "uploads"
 GENERATED_DIR = "generated"
 DB_NAME = "cinema_studio.db"
@@ -34,13 +38,63 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- DATABASE SETUP ---
+# --- COMFYUI BRIDGE ---
+class ComfyBridge:
+    def __init__(self, server_address="127.0.0.1:8188"):
+        self.server_address = server_address
+        self.client_id = str(random.randint(100000, 999999))
+
+    def upload_image(self, file_path):
+        """Uploads the local source image to ComfyUI's input folder"""
+        url = f"http://{self.server_address}/upload/image"
+        with open(file_path, "rb") as file:
+            files = {"image": file}
+            data = {"overwrite": "true"}
+            response = requests.post(url, files=files, data=data)
+            return response.json()
+
+    def queue_prompt(self, workflow):
+        p = {"prompt": workflow, "client_id": self.client_id}
+        data = json.dumps(p).encode('utf-8')
+        req = urllib.request.Request(f"http://{self.server_address}/prompt", data=data)
+        return json.loads(urllib.request.urlopen(req).read())
+
+    def get_image(self, workflow):
+        ws = websocket.WebSocket()
+        ws.connect(f"ws://{self.server_address}/ws?clientId={self.client_id}")
+        prompt_id = self.queue_prompt(workflow)['prompt_id']
+        
+        while True:
+            out = ws.recv()
+            if isinstance(out, str):
+                message = json.loads(out)
+                if message['type'] == 'executing':
+                    data = message['data']
+                    if data['node'] is None and data['prompt_id'] == prompt_id:
+                        break # Execution is done
+        
+        # Fetch history to get the filename
+        with urllib.request.urlopen(f"http://{self.server_address}/history/{prompt_id}") as response:
+            history = json.loads(response.read())
+            
+        # Extract filename from Node 9 (SaveImage)
+        history_data = history[prompt_id]
+        outputs = history_data['outputs']
+        
+        for node_id in outputs:
+            node_output = outputs[node_id]
+            if 'images' in node_output:
+                for image in node_output['images']:
+                    return image['filename']
+        return None
+
+comfy = ComfyBridge()
+
+# --- DATABASE ---
 def init_db():
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-
-    c.execute(
-        """
+    c.execute("""
         CREATE TABLE IF NOT EXISTS generated_content (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             type TEXT NOT NULL,
@@ -54,52 +108,17 @@ def init_db():
             parent_id INTEGER,
             created_at REAL
         )
-        """
-    )
-    c.execute(
-        """
-        CREATE TABLE IF NOT EXISTS uploads (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            base64_data TEXT NOT NULL,
-            created_at REAL
-        )
-        """
-    )
+    """)
     conn.commit()
     conn.close()
 
 init_db()
 
-# --- PYDANTIC MODELS ---
-class GenerateImageRequest(BaseModel):
-    prompt: str
-    camera: str
-    lens: str
-    focal_length: str
-    aspect_ratio: str  # e.g., "16:9", "21:9", "9:16", "1:1"
-    reference_images: List[str] = []
-    image_strength: float = 0.75
-
+# --- MODELS ---
 class MultishotRequest(BaseModel):
     source_image_id: int
 
-class UpscaleRequest(BaseModel):
-    proxy_ids: List[int]
-
-class UploadRequest(BaseModel):
-    base64_data: str
-
-class FavoriteRequest(BaseModel):
-    is_favorite: bool
-
-class GenerateVideoRequest(BaseModel):
-    image_url: str
-    prompt: str
-    camera: str
-    lens: str
-    focal_length: str
-
-# --- HELPER FUNCTIONS ---
+# --- HELPERS ---
 def get_db_item(item_id: int):
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
@@ -109,210 +128,170 @@ def get_db_item(item_id: int):
     conn.close()
     return item
 
-def calculate_image_size(aspect_ratio: str):
-    """
-    Maps UI aspect ratios to Recraft V3 specific resolutions.
-    """
-    # Recraft supports dictionary sizes {width: x, height: y}
-    if aspect_ratio == "21:9":
-        return {"width": 1440, "height": 616} # Ultra-Wide Cinematic
-    elif aspect_ratio == "16:9":
-        return {"width": 1440, "height": 810} # Standard HD
-    elif aspect_ratio == "4:3":
-        return {"width": 1440, "height": 1080}
-    elif aspect_ratio == "1:1":
-        return {"width": 1024, "height": 1024} # Square
-    elif aspect_ratio == "9:16":
-        return {"width": 810, "height": 1440} # Vertical
-    else:
-        return "landscape_16_9" # Default fallback
-
-async def generate_recraft_shot(
-    prompt: str,
-    angle_label: str,
-    ui_label: str,
-    ref_url: str,
-    parent_id: int,
-    semaphore: asyncio.Semaphore,
-):
-    full_prompt = f"{angle_label}. {prompt}. Cinematic lighting, photorealistic 8k, highly detailed."
-    
-    # Multishots always default to 16:9 for the storyboard grid, 
-    # but we could match the source AR if we wanted. 
-    # For now, 16:9 is best for the grid layout.
-    image_size = {"width": 1440, "height": 810} 
-
-    async with semaphore:
-        try:
-            handler = fal_client.submit(
-                "fal-ai/recraft/v3/text-to-image",
-                arguments={
-                    "prompt": full_prompt,
-                    "image_size": image_size,
-                    "style": "realistic_image",
-                    "images": [{"url": ref_url}], 
-                },
-            )
-            result = handler.get()
-            image_url = result["images"][0]["url"]
-
-            conn = sqlite3.connect(DB_NAME)
-            c = conn.cursor()
-            c.execute(
-                "INSERT INTO generated_content (type, prompt, url, camera, lens, focal_length, is_proxy, parent_id, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                ("image", full_prompt, image_url, ui_label, "Recraft V3", "Cinematic", 1, parent_id, time.time()),
-            )
-            new_id = c.lastrowid
-            conn.commit()
-            conn.close()
-            return new_id
-        except Exception as e:
-            print(f"Recraft generation failed for {ui_label}: {e}")
-            return None
+def load_workflow_template():
+    # Make sure workflow_api.json exists in the same folder!
+    try:
+        with open("workflow_api.json", "r") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print("ERROR: workflow_api.json not found.")
+        return {}
 
 # --- ENDPOINTS ---
 
-# 1. GENERATE IMAGE (SOURCE)
-@app.post("/generate-image")
-async def generate_image(req: GenerateImageRequest):
-    print(f"Generating Source ({req.aspect_ratio}): {req.prompt}")
-
-    full_prompt = f"{req.prompt}, cinematic shot, {req.camera}, {req.lens} lens, {req.focal_length}, 8k masterpiece"
+@app.get("/history")
+async def get_history():
+    """
+    Returns the list of generated images, BUT hides the 'proxy' (multishot) 
+    child images to prevent the gallery from getting flooded and slow.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
     
-    # NEW: Calculate exact dimensions based on user selection
-    target_size = calculate_image_size(req.aspect_ratio)
+    # FIX: Added "WHERE is_proxy = 0" to filter out the clutter
+    c.execute("SELECT * FROM generated_content WHERE is_proxy = 0 ORDER BY id DESC")
+    
+    items = c.fetchall()
+    conn.close()
+    return items
 
-    try:
-        handler = fal_client.submit(
-            "fal-ai/recraft/v3/text-to-image",
-            arguments={
-                "prompt": full_prompt,
-                "image_size": target_size, # Pass the dynamic size
-                "style": "realistic_image",
-                "images": [{"url": req.reference_images[0]}] if req.reference_images else []
-            },
-        )
+@app.get("/proxies/{parent_id}")
+async def get_proxies(parent_id: int):
+    """
+    Fetches only the Multishot/Proxy images for a specific parent.
+    """
+    conn = sqlite3.connect(DB_NAME)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    c.execute("SELECT * FROM generated_content WHERE parent_id = ? ORDER BY id ASC", (parent_id,))
+    items = c.fetchall()
+    conn.close()
+    return items
 
-        result = handler.get()
-        image_url = result["images"][0]["url"]
-
-        conn = sqlite3.connect(DB_NAME)
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO generated_content (type, prompt, url, camera, lens, focal_length, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            ("image", req.prompt, image_url, req.camera, req.lens, req.focal_length, time.time()),
-        )
-        conn.commit()
-        conn.close()
-
-        return {"status": "success", "image_url": image_url}
-
-    except Exception as e:
-        print(f"Fal/Recraft Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-# 2. MULTISHOT
 @app.post("/generate-multishot")
 async def generate_multishot(req: MultishotRequest):
     source_item = get_db_item(req.source_image_id)
     if not source_item:
-        raise HTTPException(status_code=404, detail="Source image not found")
+        raise HTTPException(status_code=404, detail="Source image DB record not found")
 
+    # --- SMART FILE RESOLUTION (Keep this part as is) ---
+    source_url = source_item["url"]
+    filename = os.path.basename(source_url)
+    local_path = None
+    potential_paths = [
+        os.path.join(GENERATED_DIR, filename),
+        os.path.join(UPLOAD_DIR, filename)
+    ]
+    for p in potential_paths:
+        if os.path.exists(p):
+            local_path = p
+            break
+            
+    if not local_path:
+        print(f"File not found locally. Attempting download from: {source_url}")
+        try:
+            response = requests.get(source_url, stream=True)
+            if response.status_code == 200:
+                temp_path = os.path.join(UPLOAD_DIR, filename)
+                with open(temp_path, 'wb') as f:
+                    for chunk in response.iter_content(1024):
+                        f.write(chunk)
+                local_path = temp_path
+            else:
+                print(f"Failed to download. Status: {response.status_code}")
+        except Exception as e:
+            print(f"Download error: {e}")
+
+    if not local_path or not os.path.exists(local_path):
+         raise HTTPException(status_code=404, detail=f"Source file not found: {filename}")
+
+    # --- UPLOAD TO COMFYUI ---
+    try:
+        upload_resp = comfy.upload_image(local_path)
+        comfy_filename = upload_resp["name"]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to connect to ComfyUI. Is it running?")
+
+    # --- DEFINE ANGLES ---
     angles = [
-        {"label": "Low Angle Hero", "suffix": "Low angle medium shot looking up at subject, heroic stature, epic sky background"},
-        {"label": "Action Medium", "suffix": "Dynamic action shot, subject moving through environment, motion blur, intensity"},
-        {"label": "Profile Close-Up", "suffix": "Strict Side Profile Close-Up, contemplative expression, sharp focus on features"},
-        {"label": "Sun Flare / Backlight", "suffix": "Cinematic silhouette shot, strong backlighting, lens flare, atmospheric mood"},
-        {"label": "High Angle (God's Eye)", "suffix": "High angle camera looking straight down from above (bird's eye view), subject far below"},
-        {"label": "Side Profile Wide", "suffix": "Wide angle side profile, subject walking through environment, rule of thirds composition"},
-        {"label": "Over-The-Shoulder", "suffix": "Over-the-shoulder shot from behind the subject, looking at the horizon, narrative perspective"},
-        {"label": "Dynamic Low Angle", "suffix": "Dutch Angle (tilted camera), dynamic composition, intense expression, dramatic atmosphere"},
-        {"label": "Extreme Close-Up", "suffix": "Extreme Close-Up (ECU) on eyes and face, highly detailed skin texture, intense emotion"}
+        {"label": "Close Up Portrait", "prompt": "Extreme close-up portrait, detailed eyes, intense stare, front view"},
+        {"label": "Wide Action", "prompt": "Wide shot, full body action pose, dynamic environment, running, motion blur"},
+        {"label": "Side Profile", "prompt": "Side profile shot, looking left, sharp jawline, contemplative"},
+        {"label": "Low Angle Hero", "prompt": "Low angle shot from below looking up, heroic stature, epic sky background"},
+        {"label": "Over Shoulder", "prompt": "Over-the-shoulder shot, back of head visible, cinematic composition"},
+        {"label": "Dutch Angle", "prompt": "Dutch angle, tilted camera, tense atmosphere, uneven horizon"}
     ]
 
-    base_prompt = source_item["prompt"]
-    clean_prompt = base_prompt
-    for word in ["looking at camera", "facing camera", "front view", "portrait", "close up", "wide shot"]:
-        clean_prompt = clean_prompt.replace(word, "").replace(word.title(), "")
+    generated_ids = []
 
-    semaphore = asyncio.Semaphore(3)
-    tasks = []
-    for angle_data in angles:
-        tasks.append(generate_recraft_shot(clean_prompt, angle_data['suffix'], angle_data['label'], source_item["url"], req.source_image_id, semaphore))
+    # --- GENERATE LOOP ---
+    base_workflow = load_workflow_template()
+    if not base_workflow:
+         raise HTTPException(status_code=500, detail="Workflow template not found")
 
-    print(f"Starting Recraft multishot generation...")
-    proxy_ids = await asyncio.gather(*tasks)
-    successful_ids = [pid for pid in proxy_ids if pid is not None]
+    for angle in angles:
+        print(f"Generating: {angle['label']}...")
+        workflow = json.loads(json.dumps(base_workflow))
 
-    return {"status": "success", "proxy_ids": successful_ids}
+        # 1. Optimization & Handcuffs (Keep these settings)
+        workflow["3"]["inputs"]["steps"] = 16 
+        workflow["42"]["inputs"]["weight"] = 0.35
+        workflow["5"]["inputs"]["width"] = 1024
+        workflow["5"]["inputs"]["height"] = 1024
+        workflow["3"]["inputs"]["seed"] = random.randint(1, 1500000000000)
+        workflow["44"]["inputs"]["image"] = comfy_filename
 
-# 3. GET PROXIES (For your new 'View Storyboard' button)
-@app.get("/proxies/{source_id}")
-async def get_proxies(source_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute(
-        "SELECT * FROM generated_content WHERE parent_id = ? AND is_proxy = 1 ORDER BY created_at ASC",
-        (source_id,),
-    )
-    rows = c.fetchall()
-    conn.close()
-    return rows
+        # --- THE FIX: DYNAMIC PROMPTING ---
+        # Instead of hardcoding "wasteland scavenger", we combine:
+        # 1. The Angle (e.g., "Side profile shot")
+        # 2. The Original Prompt (e.g., "A cyberpunk hacker...")
+        # 3. The Camera Metadata (e.g., "Sony A7RIII")
+        
+        original_prompt = source_item['prompt'] # <--- This comes from your DB
+        camera_info = f"{source_item['camera']} {source_item['lens']}" if source_item['camera'] else ""
+        
+        # We strip "cinematic photo of..." from the original if it exists to avoid duplication
+        # but simple concatenation works best for InstantID.
+        full_prompt = f"{angle['prompt']}, {original_prompt}, {camera_info}, detailed, 8k"
 
-# 4. HISTORY & UTILS
-@app.get("/history")
-async def get_history():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM generated_content WHERE is_proxy = 0 ORDER BY created_at DESC")
-    rows = c.fetchall()
-    conn.close()
-    return rows
+        workflow["6"]["inputs"]["text"] = full_prompt
+        
+        # ----------------------------------
 
-@app.post("/upload")
-async def upload_image(req: UploadRequest):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("INSERT INTO uploads (base64_data, created_at) VALUES (?, ?)", (req.base64_data, time.time()))
-    conn.commit()
-    conn.close()
-    return {"status": "success"}
+        # Execute
+        try:
+            output_filename = comfy.get_image(workflow)
+            if output_filename:
+                img_url = f"http://127.0.0.1:8188/view?filename={output_filename}&type=output"
+                target_filename = f"multishot_{angle['label'].replace(' ', '_')}_{int(time.time())}.png"
+                target_path = os.path.join(GENERATED_DIR, target_filename)
+                
+                r = requests.get(img_url)
+                with open(target_path, "wb") as f:
+                    f.write(r.content)
+                
+                final_url = f"http://localhost:8000/generated/{target_filename}"
 
-@app.get("/uploads")
-async def get_uploads():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    c.execute("SELECT * FROM uploads ORDER BY created_at DESC")
-    rows = c.fetchall()
-    conn.close()
-    return rows
+                conn = sqlite3.connect(DB_NAME)
+                c = conn.cursor()
+                c.execute(
+                    "INSERT INTO generated_content (type, prompt, url, camera, lens, focal_length, is_proxy, parent_id, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    ("image", full_prompt, final_url, angle['label'], "InstantID Fast", "Cinematic", 1, req.source_image_id, time.time()),
+                )
+                generated_ids.append(c.lastrowid)
+                conn.commit()
+                conn.close()
+        except Exception as e:
+            print(f"Failed to generate {angle['label']}: {e}")
 
-@app.delete("/history/{item_id}")
-async def delete_item(item_id: int):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("DELETE FROM generated_content WHERE id = ?", (item_id,))
-    conn.commit()
-    conn.close()
-    return {"status": "deleted"}
+    return {"status": "success", "proxy_ids": generated_ids}
 
-@app.put("/history/{item_id}/favorite")
-async def toggle_favorite(item_id: int, req: FavoriteRequest):
-    conn = sqlite3.connect(DB_NAME)
-    c = conn.cursor()
-    c.execute("UPDATE generated_content SET is_favorite = ? WHERE id = ?", (1 if req.is_favorite else 0, item_id))
-    conn.commit()
-    conn.close()
-    return {"status": "updated"}
-
-@app.post("/upscale-proxies")
-async def upscale_proxies(req: UpscaleRequest):
-    return {"status": "skipped", "message": "Recraft output is already high quality"}
+# --- STATIC FILES ---
+from fastapi.staticfiles import StaticFiles
+app.mount("/generated", StaticFiles(directory=GENERATED_DIR), name="generated")
+app.mount("/uploads", StaticFiles(directory=UPLOAD_DIR), name="uploads")
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
