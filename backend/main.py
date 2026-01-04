@@ -131,7 +131,7 @@ class ComfyBridge:
 
 # --- INITIALIZATION ---
 # Your specific RunPod Address
-comfy = ComfyBridge(server_address="9cluaux8g708sd-8188.proxy.runpod.net")
+comfy = ComfyBridge(server_address="https://mt7wsv4h5cnn07-8188.proxy.runpod.net/")
 
 # --- DATABASE ---
 def init_db():
